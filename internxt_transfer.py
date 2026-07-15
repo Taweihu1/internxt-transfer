@@ -206,7 +206,7 @@ def right_click_row(page, locator):
     page.wait_for_timeout(500)
 
 
-def sha256_file(path: Path, block=1024 * 1024) -> str:
+def sha256_file(path: Path, block=1024 * 1024, on_progress=None) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while True:
@@ -214,6 +214,8 @@ def sha256_file(path: Path, block=1024 * 1024) -> str:
             if not b:
                 break
             h.update(b)
+            if on_progress:
+                on_progress(len(b))
     return h.hexdigest()
 
 
@@ -332,6 +334,33 @@ class StatusTicker:
         else:
             print("   (目前沒有檔案在傳輸中)")
         sys.stdout.flush()
+
+
+def _sha256_file_with_progress(path: Path, ticker: StatusTicker, key: str, label: str = "計算雜湊中") -> str:
+    """sha256_file with a live percentage shown via the ticker. Hashing a
+    multi-GB file (a chunked upload's source, or a reconstructed
+    download) can take many minutes on a slow disk with nothing else
+    touching the ticker in that window — without this, the status
+    ticker prints "沒有檔案在傳輸中" the whole time, which reads exactly
+    like a hang even though it's just an invisible, legitimately slow
+    read+hash."""
+    total = path.stat().st_size
+    read = 0
+    last_pct = -1
+
+    def on_progress(n):
+        nonlocal read, last_pct
+        read += n
+        pct = int(read * 100 / total) if total else 100
+        if pct != last_pct:
+            last_pct = pct
+            ticker.set_current(key, f"{label} {pct}%")
+
+    ticker.set_current(key, f"{label} 0%")
+    try:
+        return sha256_file(path, on_progress=on_progress)
+    finally:
+        ticker.set_current(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -612,10 +641,12 @@ def _upload_chunked(page, abs_path: Path, ticker: StatusTicker, key: str, manife
         except OSError:
             pass
 
+    file_sha256 = _sha256_file_with_progress(abs_path, ticker, key)
+
     manifest_obj = {
         "original_name": original_name,
         "size": size,
-        "sha256": sha256_file(abs_path),
+        "sha256": file_sha256,
         "chunk_count": n,
         "chunks": [_chunk_name(original_name, i, n, transfer_id) for i in range(1, n + 1)],
         "transfer_id": transfer_id,
@@ -647,12 +678,12 @@ def _verify_upload(page, remote_dir, abs_path: Path, ticker: StatusTicker, key: 
     against the local source — see module docstring point 6. Raises on
     mismatch (including "couldn't even find it remotely"), which the
     caller treats as an upload failure eligible for retry."""
-    expected = sha256_file(abs_path)
     tmp_path = SCRIPT_DIR / f"_verify_tmp_{abs_path.name}"
+    expected = _sha256_file_with_progress(abs_path, ticker, key, label="計算本機雜湊中")
     ticker.set_current(key, "驗證中")
     try:
         chunk_verified_hash = _download_and_extract_file(page, remote_dir, abs_path.name, tmp_path, ticker)
-        actual = chunk_verified_hash or sha256_file(tmp_path)
+        actual = chunk_verified_hash or _sha256_file_with_progress(tmp_path, ticker, key, label="計算下載後雜湊中")
         if actual != expected:
             raise RuntimeError(f"本機雜湊 {expected} != 下載回來後的雜湊 {actual}")
     finally:
@@ -775,7 +806,7 @@ def _download_current_folder_zip(page, tmp_path: Path, ticker: StatusTicker, lab
         ticker.set_current(label, None)
 
 
-def _reassemble_chunks_in_dir(local_dir: Path):
+def _reassemble_chunks_in_dir(local_dir: Path, ticker: StatusTicker):
     """Post-process a freshly-extracted directory: find any chunk
     manifests (see docstring point 5), reconstruct + sha256-verify the
     original file from its chunks, and remove the fragments so the
@@ -798,7 +829,7 @@ def _reassemble_chunks_in_dir(local_dir: Path):
         with open(dest, "wb") as out:
             for p in chunk_paths:
                 out.write(p.read_bytes())
-        actual = sha256_file(dest)
+        actual = _sha256_file_with_progress(dest, ticker, original_name, label="計算重組後雜湊中")
         if actual != obj["sha256"]:
             dest.unlink(missing_ok=True)
             raise RuntimeError(f"{original_name} 分片重組後雜湊不符（預期 {obj['sha256']}，實際 {actual}）")
@@ -912,7 +943,7 @@ def _download_and_extract_file(page, remote_dir, target_name, dest_path: Path, t
         with open(dest_path, "wb") as out:
             for cname in obj["chunks"]:
                 out.write((tmp_dir / cname).read_bytes())
-        actual = sha256_file(dest_path)
+        actual = _sha256_file_with_progress(dest_path, ticker, target_name, label="計算重組後雜湊中")
         if actual != obj["sha256"]:
             dest_path.unlink(missing_ok=True)
             raise RuntimeError(f"分片重組後雜湊不符（預期 {obj['sha256']}，實際 {actual}）")
@@ -960,7 +991,7 @@ def do_download(args):
                                 zf.extractall(local_dest)
                         finally:
                             DOWNLOAD_TMP_ZIP.unlink(missing_ok=True)
-                        _reassemble_chunks_in_dir(local_dest)
+                        _reassemble_chunks_in_dir(local_dest, ticker)
                         print(f"完成下載目錄: {remote} -> {local_dest}")
                     else:
                         # last segment didn't navigate anywhere -> treat as a filename
