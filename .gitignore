@@ -1,0 +1,9 @@
+auth_state.json
+transfer_manifest.json
+__pycache__/
+*.pyc
+.claude/
+downloads/
+_chunk_tmp_*/
+_dl_chunk_tmp_*/
+debug_screenshot.png
