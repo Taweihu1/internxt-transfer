@@ -746,6 +746,18 @@ def _verify_upload(page, remote_dir, abs_path: Path, ticker: StatusTicker, key: 
         ticker.set_current(key, None)
 
 
+def _manifest_from_args(args):
+    """Use a custom manifest path if --manifest was given, else the
+    default next to the script/exe. Running multiple transfers at once
+    (e.g. several backgrounded jobs on Linux) MUST use separate manifest
+    files: each process loads the whole file into memory once and
+    overwrites it wholesale on every save, so two processes sharing one
+    file will silently clobber each other's progress. auth_state.json is
+    safe to share (only ever read here, never written outside `login`)."""
+    path = getattr(args, "manifest", None)
+    return Manifest(path=Path(path)) if path else Manifest()
+
+
 def do_upload(args):
     local_path = Path(args.local).resolve()
     if not local_path.exists():
@@ -755,7 +767,7 @@ def do_upload(args):
     if not files:
         sys.exit("本機路徑底下沒有可上傳的檔案。")
 
-    manifest = Manifest()
+    manifest = _manifest_from_args(args)
     job_keys = [f"upload::{args.remote}::{rel}" for _, rel in files]
     ticker = StatusTicker(manifest, interval=args.interval, job_keys=job_keys)
     ticker.start()
@@ -1042,7 +1054,7 @@ def do_download(args):
     if not segments:
         sys.exit("--remote 不能是空的或根目錄。")
 
-    manifest = Manifest()
+    manifest = _manifest_from_args(args)
     key = f"download::{remote}"
 
     with sync_playwright() as pw:
@@ -1111,11 +1123,12 @@ def do_download(args):
 # never moves, re-uploads, or modifies anything, remote or local.
 # ---------------------------------------------------------------------------
 def cmd_audit(args):
-    if not MANIFEST_FILE.exists():
-        print("找不到 transfer_manifest.json，沒有任何上傳紀錄可稽核。")
+    manifest_path = Path(args.manifest) if getattr(args, "manifest", None) else MANIFEST_FILE
+    if not manifest_path.exists():
+        print(f"找不到 {manifest_path}，沒有任何上傳紀錄可稽核。")
         return
 
-    manifest_data = json.loads(MANIFEST_FILE.read_text(encoding="utf-8"))
+    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
     by_dir = defaultdict(list)
     for key, val in manifest_data.items():
         if not key.startswith("upload::") or "::chunk" in key:
@@ -1209,16 +1222,24 @@ def main():
     p_up.add_argument("--interval", type=int, default=30, help="狀態回報間隔秒數 (預設 30)")
     p_up.add_argument("--retries", type=int, default=3, help="單檔失敗重試次數 (預設 3)")
     p_up.add_argument("--verify", action="store_true", help="上傳後下載回來比對 sha256，不符則視為失敗並重試")
+    p_up.add_argument("--manifest", default=None,
+                       help="自訂 transfer_manifest.json 路徑；同時背景執行多個傳輸時，每個都要指定不同的檔案，"
+                            "否則會互相覆蓋彼此的進度紀錄")
 
     p_dl = sub.add_parser("download", help="從 Internxt Drive 下載檔案/目錄到本機")
     p_dl.add_argument("remote", help="遠端來源路徑（檔案或目錄）")
     p_dl.add_argument("local", help="本機存放目錄")
     p_dl.add_argument("--interval", type=int, default=30, help="狀態回報間隔秒數 (預設 30)")
     p_dl.add_argument("--retries", type=int, default=3, help="單檔失敗重試次數 (預設 3)")
+    p_dl.add_argument("--manifest", default=None,
+                       help="自訂 transfer_manifest.json 路徑；同時背景執行多個傳輸時，每個都要指定不同的檔案，"
+                            "否則會互相覆蓋彼此的進度紀錄")
 
-    sub.add_parser("status", help="顯示目前傳輸紀錄 (transfer_manifest.json)")
+    p_st = sub.add_parser("status", help="顯示目前傳輸紀錄 (transfer_manifest.json)")
+    p_st.add_argument("--manifest", default=None, help="自訂 transfer_manifest.json 路徑")
 
-    sub.add_parser("audit", help="核對 transfer_manifest.json 裡標記完成的上傳，是否真的落在正確的遠端資料夾（唯讀）")
+    p_ad = sub.add_parser("audit", help="核對 transfer_manifest.json 裡標記完成的上傳，是否真的落在正確的遠端資料夾（唯讀）")
+    p_ad.add_argument("--manifest", default=None, help="自訂 transfer_manifest.json 路徑")
 
     p_dbg = sub.add_parser("debug-dump", help="登入後印出畫面上的按鈕/項目，方便校正選取器")
     p_dbg.add_argument("--remote", default="", help="要先導航進去的遠端目錄（可留空）")
@@ -1231,13 +1252,13 @@ def main():
     # `"` by the OS's C-runtime argv parser. `"` can never legitimately
     # appear in a Windows path or in a remote Internxt path, so stripping
     # a trailing one here undoes exactly that mis-parse.
-    for attr in ("local", "remote"):
+    for attr in ("local", "remote", "manifest"):
         val = getattr(args, attr, None)
         if val:
             setattr(args, attr, val.rstrip('"'))
 
     if args.cmd == "status":
-        Manifest().print_status()
+        _manifest_from_args(args).print_status()
         return
 
     if args.cmd == "login":
