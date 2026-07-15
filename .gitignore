@@ -7,3 +7,6 @@ downloads/
 _chunk_tmp_*/
 _dl_chunk_tmp_*/
 debug_screenshot.png
+build/
+dist/
+*.spec

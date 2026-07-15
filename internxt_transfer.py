@@ -113,7 +113,15 @@ from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
 BASE_URL = "https://drive.internxt.com"
-SCRIPT_DIR = Path(__file__).parent
+# When frozen by PyInstaller (--onefile), __file__ points inside a fresh
+# temp extraction folder that's recreated on every run — auth_state.json
+# and transfer_manifest.json would never be found from a previous run if
+# anchored there. Anchor to the actual .exe's own folder instead in that
+# case, so both persist next to it like they do for the plain script.
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = Path(sys.executable).parent
+else:
+    SCRIPT_DIR = Path(__file__).parent
 AUTH_STATE_FILE = SCRIPT_DIR / "auth_state.json"
 MANIFEST_FILE = SCRIPT_DIR / "transfer_manifest.json"
 
@@ -257,14 +265,27 @@ class Manifest:
     def status(self, key):
         return self.data.get(key, {}).get("status", "pending")
 
-    def mark(self, key, status, size=None, error=None):
+    def sha256_of(self, key):
+        return self.data.get(key, {}).get("sha256")
+
+    def mark(self, key, status, size=None, error=None, sha256=None):
         with self._lock:
             entry = self.data.setdefault(key, {})
             entry["status"] = status
             entry["ts"] = datetime.now().isoformat(timespec="seconds")
             if size is not None:
                 entry["size"] = size
+            if sha256 is not None:
+                entry["sha256"] = sha256
             entry["error"] = error
+            self._save()
+
+    def clear(self, key):
+        """Remove a key entirely, so it's treated as not-yet-uploaded
+        again. Used to force a re-upload of just one bad chunk after a
+        per-chunk hash mismatch, instead of redoing the whole file."""
+        with self._lock:
+            self.data.pop(key, None)
             self._save()
 
     def _save(self):
@@ -602,6 +623,22 @@ def _upload_one(page, abs_path: Path, ticker: StatusTicker, key: str, label="上
         ticker.set_current(key, None)
 
 
+class ChunkHashMismatch(Exception):
+    """Raised by _download_and_extract_file when per-chunk verification
+    (see _upload_chunked's chunk_sha256) finds one or more downloaded
+    chunks whose hash doesn't match what was recorded at upload time.
+    Carries enough to let do_upload's --verify handling clear just those
+    chunks' manifest entries, so the next retry re-sends only the bad
+    piece(s) instead of the whole file."""
+    def __init__(self, target_name, transfer_id, bad_indices, total):
+        self.target_name = target_name
+        self.transfer_id = transfer_id
+        self.bad_indices = bad_indices
+        self.total = total
+        bad_list = "、".join(str(i) for i in bad_indices)
+        super().__init__(f"分片驗證失敗: {target_name} 第 {bad_list}/{total} 片雜湊不符")
+
+
 def _upload_chunked(page, abs_path: Path, ticker: StatusTicker, key: str, manifest: Manifest):
     """Upload a large file as distinctively-named chunks + a manifest
     instead of one single upload (see module docstring point 5).
@@ -634,12 +671,29 @@ def _upload_chunked(page, abs_path: Path, ticker: StatusTicker, key: str, manife
                     chunk_path.unlink(missing_ok=True)
                 if not ok:
                     raise RuntimeError(f"分片 {i}/{n} 上傳逾時或未偵測到完成狀態")
-                manifest.mark(chunk_key, "done", size=len(data))
+                manifest.mark(chunk_key, "done", size=len(data), sha256=hashlib.sha256(data).hexdigest())
     finally:
         try:
             tmp_dir.rmdir()
         except OSError:
             pass
+
+    # Per-chunk hashes let a later verify pinpoint exactly which chunk is
+    # bad (see ChunkHashMismatch) instead of only knowing the whole-file
+    # reconstruction doesn't match. Chunks skipped above because they were
+    # already "done" from an older run predating this feature won't have
+    # one stored yet — backfill by re-reading that chunk's byte range from
+    # the local source rather than failing.
+    chunk_hashes = []
+    with open(abs_path, "rb") as f:
+        for i in range(1, n + 1):
+            chunk_key = f"{key}::chunk{i}of{n}::{transfer_id}"
+            h = manifest.sha256_of(chunk_key)
+            if h is None:
+                f.seek((i - 1) * CHUNK_SIZE_BYTES)
+                h = hashlib.sha256(f.read(CHUNK_SIZE_BYTES)).hexdigest()
+                manifest.mark(chunk_key, "done", sha256=h)
+            chunk_hashes.append(h)
 
     file_sha256 = _sha256_file_with_progress(abs_path, ticker, key)
 
@@ -649,6 +703,7 @@ def _upload_chunked(page, abs_path: Path, ticker: StatusTicker, key: str, manife
         "sha256": file_sha256,
         "chunk_count": n,
         "chunks": [_chunk_name(original_name, i, n, transfer_id) for i in range(1, n + 1)],
+        "chunk_sha256": chunk_hashes,
         "transfer_id": transfer_id,
     }
     manifest_path = SCRIPT_DIR / _manifest_name(original_name, transfer_id)
@@ -741,6 +796,14 @@ def do_upload(args):
                         elif args.verify:
                             try:
                                 _verify_upload(page, remote_dir, abs_path, ticker, key)
+                            except ChunkHashMismatch as ce:
+                                for i in ce.bad_indices:
+                                    bad_key = f"{key}::chunk{i}of{ce.total}::{ce.transfer_id}"
+                                    manifest.clear(bad_key)
+                                    print(f"   分片 {i}/{ce.total} 雜湊不符，已清除其上傳紀錄，"
+                                          f"下次重試只會重傳這一片")
+                                ok = False
+                                last_err = f"驗證失敗: {ce}"
                             except Exception as ve:
                                 ok = False
                                 last_err = f"驗證失敗: {ve}"
@@ -932,6 +995,7 @@ def _download_and_extract_file(page, remote_dir, target_name, dest_path: Path, t
                                    label=f"{target_name} (分片清單)")
         obj = json.loads(manifest_path.read_text(encoding="utf-8"))
         n = len(obj["chunks"])
+        chunk_hashes = obj.get("chunk_sha256")  # absent for manifests from before this feature
         for i, cname in enumerate(obj["chunks"], 1):
             cpath = tmp_dir / cname
             if cpath.exists():
@@ -939,6 +1003,22 @@ def _download_and_extract_file(page, remote_dir, target_name, dest_path: Path, t
             if cname not in names:
                 raise RuntimeError(f"找不到分片 {cname}")
             _download_item_direct(page, cname, cpath, ticker, label=f"{target_name} 分片 {i}/{n}")
+
+        # Per-chunk verification first: pinpoints exactly which piece is
+        # bad (see ChunkHashMismatch) instead of only learning the whole
+        # reconstruction doesn't match, which is what let do_upload's
+        # --verify handling re-send just that one chunk instead of the
+        # whole file.
+        if chunk_hashes:
+            bad_indices = []
+            for i, (cname, expected_hash) in enumerate(zip(obj["chunks"], chunk_hashes), 1):
+                actual_hash = _sha256_file_with_progress(
+                    tmp_dir / cname, ticker, f"{target_name}::chunk{i}",
+                    label=f"驗證分片 {i}/{n} 雜湊中")
+                if actual_hash != expected_hash:
+                    bad_indices.append(i)
+            if bad_indices:
+                raise ChunkHashMismatch(target_name, obj["transfer_id"], bad_indices, n)
 
         with open(dest_path, "wb") as out:
             for cname in obj["chunks"]:

@@ -64,6 +64,22 @@ python internxt_transfer.py audit
 python internxt_transfer.py debug-dump --remote <remote/folder/path>
 ```
 
+## Building a standalone .exe
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --console --name internxt_transfer --collect-all playwright internxt_transfer.py
+```
+
+`--collect-all playwright` is required — Playwright ships a Node.js driver
+(`driver/node.exe`) as package data that PyInstaller won't pick up
+otherwise, and the frozen exe will fail at runtime without it. The result
+is `dist/internxt_transfer.exe`, fully standalone (no Python install
+needed on the target machine) — just a Chromium-based browser (Brave or
+Chrome). Run it exactly like the script: `internxt_transfer.exe login`,
+`internxt_transfer.exe upload ...`, etc. `auth_state.json` and
+`transfer_manifest.json` are created next to the .exe itself.
+
 ## Known limitations
 
 - Uploading a single file ≥~100MB in one shot can crash the Playwright
