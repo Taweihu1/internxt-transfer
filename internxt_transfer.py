@@ -440,12 +440,45 @@ def _open_row(page, name, timeout=8000):
     page.wait_for_timeout(1500)
 
 
-def _folder_exists_here(page, name, timeout=4000):
+def _folder_exists_here(page, name, timeout=6000):
     try:
         page.get_by_text(name, exact=True).first.wait_for(timeout=timeout)
         return True
     except PWTimeout:
         return False
+
+
+def _current_folder_name(page):
+    """Read the actual breadcrumb segment for the folder currently open —
+    the rightmost text element in the breadcrumb bar next to the root
+    "雲端硬碟" link. This is a stronger navigation check than comparing
+    the item listing before/after a click: if the page was still
+    mid-render when the "before" snapshot was taken, the listing simply
+    finishing its own load can look exactly like "the listing changed"
+    even though the click never navigated anywhere. Confirmed root cause
+    of a duplicate "DavAspire3" folder getting created at Drive ROOT
+    instead of nested under pCLoud where it belonged — the before/after
+    check on entering pCLoud passed on a false positive, so the next
+    segment's create-attempt ran while still sitting at root."""
+    segments = page.evaluate(
+        """() => {
+            const els = Array.from(document.querySelectorAll('div,span,p'))
+                .filter(e => {
+                    if (e.offsetParent === null) return false;
+                    const r = e.getBoundingClientRect();
+                    return r.top > 60 && r.top < 80 && r.height > 0 && r.height < 30
+                        && r.left > 260 && r.left < 900;
+                });
+            const seen = new Set();
+            const out = [];
+            for (const e of els) {
+                const t = e.textContent.trim();
+                if (t && t.length < 60 && !seen.has(t)) { seen.add(t); out.push(t); }
+            }
+            return out;
+        }"""
+    )
+    return segments[-1] if segments else None
 
 
 def _create_folder_here(page, name):
@@ -465,11 +498,12 @@ def _create_folder_here(page, name):
 def navigate_existing_only(page, remote_path, hard_reload=False):
     """Like ensure_folder_path but never creates anything, and verifies
     every segment is actually a folder (not just a row with matching
-    text) — clicking a segment must change the listing, otherwise it
-    was a file and we stop short. Returns False if any segment is
-    missing or turns out to be a file rather than a folder; this is
-    how do_download() tells apart "path is a directory" from "path is
-    a file inside its parent directory."
+    text) — clicking a segment must actually navigate there (confirmed
+    via the breadcrumb, see _current_folder_name), otherwise it was a
+    file and we stop short. Returns False if any segment is missing or
+    turns out to be a file rather than a folder; this is how
+    do_download() tells apart "path is a directory" from "path is a
+    file inside its parent directory."
 
     hard_reload=True does a real page.goto() instead of a client-side
     SPA navigation click — cheap extra safety against any stale UI
@@ -485,11 +519,10 @@ def navigate_existing_only(page, remote_path, hard_reload=False):
         if not _folder_exists_here(page, seg):
             print(f"   ('{seg}' 不存在，停在上一層)")
             return False
-        before = list_current_folder(page)
         _open_row(page, seg)
-        after = list_current_folder(page)
-        if after == before:
-            return False  # click did nothing to the listing -> seg is a file, not a folder
+        page.wait_for_timeout(500)
+        if _current_folder_name(page) != seg:
+            return False  # didn't actually navigate there -> seg is a file, not a folder
     return True
 
 
@@ -509,6 +542,10 @@ def _settle_new_folder(page, segments, attempts=5):
                 ok = False
                 break
             _open_row(page, seg)
+            page.wait_for_timeout(500)
+            if _current_folder_name(page) != seg:
+                ok = False
+                break
         if ok:
             return
         print(f"   （新資料夾尚未穩定，重新確認中 {attempt + 1}/{attempts} ...）")
@@ -530,19 +567,23 @@ def ensure_folder_path(page, remote_path):
     """Navigate to remote_path from Drive root, creating any missing
     segment along the way. Leaves `page` inside the target folder.
 
-    Verifies every single _open_row click actually changed the folder
-    listing (same check navigate_existing_only already did for
-    downloads) — a click that silently does nothing previously left
-    `page` one level up from where do_upload assumed it was, with no
-    error raised, causing files to upload into the wrong (parent)
-    folder. Raises RuntimeError instead so the caller's existing
-    per-file retry/failure handling catches it."""
+    Verifies every single _open_row click actually landed in the right
+    folder by checking the breadcrumb (see _current_folder_name), not by
+    comparing the item listing before/after — that comparison can give a
+    false positive if the page was still mid-render when the "before"
+    snapshot was taken (the listing finishing its own load looks exactly
+    like "the listing changed"). That false positive was the confirmed
+    root cause of a real incident: a duplicate "DavAspire3" folder ended
+    up created at Drive ROOT instead of nested under pCLoud, because
+    entering pCLoud silently failed while the listing-based check passed
+    anyway. Raises RuntimeError so the caller's existing per-file
+    retry/failure handling catches it, instead of silently uploading into
+    the wrong folder."""
     js_click(page.locator(CY["drive_root"]))
     page.wait_for_timeout(1500)
     segments = [s for s in remote_path.strip("/").split("/") if s]
     created_any = False
     for seg in segments:
-        before = list_current_folder(page)
         if _folder_exists_here(page, seg):
             _open_row(page, seg)
         else:
@@ -550,9 +591,10 @@ def ensure_folder_path(page, remote_path):
             _create_folder_here(page, seg)
             _open_row(page, seg)
             created_any = True
-        after = list_current_folder(page)
-        if after == before:
-            raise RuntimeError(f"進入資料夾 '{seg}' 似乎沒有生效（列表沒有變化），"
+        page.wait_for_timeout(500)
+        current = _current_folder_name(page)
+        if current != seg:
+            raise RuntimeError(f"進入資料夾 '{seg}' 後，畫面顯示目前位置是「{current}」，"
                                 f"為避免上傳到錯誤位置而中止")
     if created_any:
         _settle_new_folder(page, segments)
