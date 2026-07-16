@@ -607,7 +607,7 @@ def ensure_folder_path(page, remote_path):
 MIN_UPLOAD_THROUGHPUT_BPS = 1_000_000  # conservative 1MB/s floor, see _wait_upload_settle
 
 
-def _wait_upload_settle(page, filename, file_size_bytes, timeout=7200):
+def _wait_upload_settle(page, filename, file_size_bytes, timeout=600):
     """Wait for an upload to actually finish — NOT just for the row to
     appear.
 
@@ -623,7 +623,17 @@ def _wait_upload_settle(page, filename, file_size_bytes, timeout=7200):
     So: enforce a size-scaled minimum wait (assuming a conservative
     1MB/s floor — real throughput observed in testing was ~2MB/s) on
     top of the presence+no-spinner+no-visible-percentage check, rather
-    than trusting the DOM signal alone."""
+    than trusting the DOM signal alone.
+
+    `timeout` is the EXTRA polling budget on top of min_wait, not a
+    replacement for it — it used to default to 7200 (2h), which meant a
+    genuinely stalled upload (browser/network issue, not just a slow
+    upload) wasn't detected as failed until up to 2 hours had passed.
+    Confirmed in production: a single chunk stalled for 48+ minutes
+    before the user gave up and manually killed the process. 600s (10
+    min) beyond min_wait is generous for any real upload at this
+    script's chunk sizes (≤80MB) while catching an actual stall in
+    single-digit minutes instead."""
     min_wait = max(10, file_size_bytes / MIN_UPLOAD_THROUGHPUT_BPS)
     start = time.time()
     deadline = start + max(timeout, min_wait + 60)
@@ -873,7 +883,7 @@ def do_upload(args):
                 attempts = 0
                 ok = False
                 last_err = None
-                connection_lost = False
+                give_up_entirely = False
                 while attempts < args.retries and not ok:
                     attempts += 1
                     try:
@@ -904,16 +914,34 @@ def do_upload(args):
                     except Exception as e:
                         last_err = str(e)
                         if "Connection closed" in last_err or "has been closed" in last_err:
-                            print(f"   Playwright 驅動程式連線已中斷(可能是大檔案觸發已知的 Node.js")
-                            print(f"   ERR_STRING_TOO_LONG 限制,見檔案開頭文件說明)。上傳可能仍在")
-                            print(f"   瀏覽器背景繼續進行 —— 請直接到 https://drive.internxt.com")
-                            print(f"   確認 {rel} 是否已經上傳成功，這個連線已經壞了，重試也沒用。")
-                            connection_lost = True
-                            break
+                            print(f"   Playwright 驅動程式連線已中斷（可能是大檔案觸發已知的 Node.js")
+                            print(f"   ERR_STRING_TOO_LONG 限制，見檔案開頭文件說明）。這個上傳可能已經")
+                            print(f"   在瀏覽器背景默默完成了——如果重新啟動瀏覽器後還是立刻失敗，")
+                            print(f"   建議到 https://drive.internxt.com 手動確認 {rel} 是否已存在。")
+
                     if not ok:
                         print(f"   第 {attempts} 次嘗試失敗: {last_err}")
                         if attempts < args.retries:
-                            print(f"   重試 {rel} ({attempts}/{args.retries}) ...")
+                            # A stalled/timed-out upload or a dead driver
+                            # connection both leave `page` in a state that
+                            # will just fail the exact same way again —
+                            # start the next attempt with a fresh browser
+                            # instead of reusing it. Confirmed in production:
+                            # a single chunk stalled for 48+ minutes before
+                            # anyone noticed, and a dead connection used to
+                            # make every remaining file in the batch fail
+                            # instantly with the same error.
+                            print(f"   重新啟動瀏覽器後重試 {rel} ({attempts}/{args.retries}) ...")
+                            safe_close(browser)
+                            try:
+                                browser, ctx, page = open_authenticated_page(pw, headless=True)
+                                folder_cache.clear()
+                            except Exception as be:
+                                print(f"   重新啟動瀏覽器失敗（{be}），已停止本次上傳，"
+                                      f"剩餘 {len(files) - idx - 1} 個檔案未處理，"
+                                      f"請重新執行同一指令接續。")
+                                give_up_entirely = True
+                                break
 
                 if ok:
                     manifest.mark(key, "done", size=abs_path.stat().st_size)
@@ -922,15 +950,7 @@ def do_upload(args):
                     manifest.mark(key, "failed", error=last_err)
                     print(f"上傳失敗: {rel} -> {last_err}")
 
-                if connection_lost:
-                    # The dead page/browser object is reused for every
-                    # remaining file — without stopping here, each one
-                    # would fail instantly with this same error (all
-                    # stamped with the same timestamp), needlessly
-                    # marking the entire rest of the batch "failed"
-                    # instead of leaving it untouched for the next run.
-                    print(f"   已停止本次上傳，剩餘 {len(files) - idx - 1} 個檔案未處理，"
-                          f"請重新執行同一指令接續。")
+                if give_up_entirely:
                     break
         finally:
             ticker.stop()
