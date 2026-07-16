@@ -776,7 +776,7 @@ def do_upload(args):
         browser, ctx, page = open_authenticated_page(pw, headless=True)
         try:
             folder_cache = set()
-            for (abs_path, rel), key in zip(files, job_keys):
+            for idx, ((abs_path, rel), key) in enumerate(zip(files, job_keys)):
                 if manifest.status(key) == "done":
                     continue
                 # rel is posix-style (forward slashes, see list_local_files);
@@ -792,6 +792,7 @@ def do_upload(args):
                 attempts = 0
                 ok = False
                 last_err = None
+                connection_lost = False
                 while attempts < args.retries and not ok:
                     attempts += 1
                     try:
@@ -826,6 +827,7 @@ def do_upload(args):
                             print(f"   ERR_STRING_TOO_LONG 限制,見檔案開頭文件說明)。上傳可能仍在")
                             print(f"   瀏覽器背景繼續進行 —— 請直接到 https://drive.internxt.com")
                             print(f"   確認 {rel} 是否已經上傳成功，這個連線已經壞了，重試也沒用。")
+                            connection_lost = True
                             break
                     if not ok:
                         print(f"   第 {attempts} 次嘗試失敗: {last_err}")
@@ -838,6 +840,17 @@ def do_upload(args):
                 else:
                     manifest.mark(key, "failed", error=last_err)
                     print(f"上傳失敗: {rel} -> {last_err}")
+
+                if connection_lost:
+                    # The dead page/browser object is reused for every
+                    # remaining file — without stopping here, each one
+                    # would fail instantly with this same error (all
+                    # stamped with the same timestamp), needlessly
+                    # marking the entire rest of the batch "failed"
+                    # instead of leaving it untouched for the next run.
+                    print(f"   已停止本次上傳，剩餘 {len(files) - idx - 1} 個檔案未處理，"
+                          f"請重新執行同一指令接續。")
+                    break
         finally:
             ticker.stop()
             safe_close(browser)
