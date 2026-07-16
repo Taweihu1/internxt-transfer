@@ -409,7 +409,21 @@ def open_authenticated_page(playwright, headless=True):
     ctx = browser.new_context(storage_state=str(AUTH_STATE_FILE), accept_downloads=True)
     page = ctx.new_page()
     page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60_000)
-    page.wait_for_timeout(8000)
+    # Internxt shows its own "Preparing your workspace — this may take a
+    # few seconds..." screen on load, which can take much longer than
+    # that once the account has accumulated a lot of data. Confirmed via
+    # screenshot to be the actual root cause of a long string of
+    # "sideNavDriveIcon" timeouts throughout a large chunked-upload job:
+    # every one of those was this script racing a real loading screen
+    # that simply hadn't finished yet, not a session/network/browser
+    # issue — a fixed 8s sleep here used to be enough when the account
+    # had less data, but stopped being enough as this job's own chunk
+    # files piled up. Wait for the actual Drive UI to appear instead.
+    try:
+        page.locator(CY["drive_root"]).wait_for(timeout=90_000)
+    except PWTimeout:
+        pass  # let the caller's own checks surface a clear error instead of failing silently here
+    page.wait_for_timeout(1500)  # small settle buffer once the sidebar appears
     return browser, ctx, page
 
 
