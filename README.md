@@ -19,7 +19,10 @@ the crypto itself.
   pieces on upload (works around a Playwright/Node driver crash on very
   large single-shot uploads) and transparently reconstructed + SHA-256
   verified on download. A killed-and-rerun chunked transfer resumes at the
-  chunk level.
+  chunk level. Each file's chunks + manifest live in their own dedicated
+  subfolder (rather than flat alongside every other file's pieces) — this
+  avoids Internxt's own web UI becoming unreliable once a folder
+  accumulates hundreds of chunked files' worth of pieces.
 - **`--verify`**: after upload, downloads the file straight back and
   compares SHA-256 against the source, catching cases where the upload
   looked successful but didn't actually land correctly server-side.

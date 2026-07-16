@@ -81,7 +81,16 @@ you need to touch this file again:
    chunk individually into a temp dir named after the transfer_id, and
    only deletes that temp dir once reassembly + hash check succeeds —
    so a killed-and-rerun single-file download resumes at the chunk
-   level too, same as chunked upload does.
+   level too, same as chunked upload does. Each file's chunks + manifest
+   go into their own dedicated CHUNK_SUBDIR_MARKER subfolder (see
+   _chunk_subdir_name) rather than flat alongside every other file's
+   pieces — confirmed in production that a folder accumulating hundreds
+   of chunked files' pieces (~70 items each) reaches a scale where
+   Internxt's own web UI becomes intermittently unreliable, unrelated to
+   this script. A file with chunks already uploaded flat from before this
+   scheme existed keeps using the flat layout for its remaining chunks
+   (see any_chunk_done_flat in _upload_chunked) rather than splitting one
+   file's pieces across two remote locations.
 6. `upload --verify` downloads each file straight back after upload
    and compares sha256 against the local source — catches exactly the
    "driver crashed but the browser silently finished the upload
@@ -164,6 +173,7 @@ CHUNK_THRESHOLD_BYTES = 80 * 1024 * 1024
 CHUNK_SIZE_BYTES = 60 * 1024 * 1024
 CHUNK_MARKER = ".ixtchunk-"
 MANIFEST_MARKER = ".ixtchunk-manifest."
+CHUNK_SUBDIR_MARKER = ".ixtchunks-"  # per-file subfolder holding one file's chunks+manifest, see _chunk_subdir_name
 DOWNLOAD_TMP_ZIP = SCRIPT_DIR / "_download_tmp.zip"
 
 _BROWSER_CANDIDATES = [
@@ -248,6 +258,28 @@ def _find_manifest_entry(names, original_name):
     prefix = f"{original_name}{MANIFEST_MARKER}"
     for n in names:
         if n.startswith(prefix) and n.endswith(".json"):
+            return n
+    return None
+
+
+def _chunk_subdir_name(original_name, transfer_id):
+    """Per-file subfolder holding just one file's chunks + manifest,
+    instead of dumping them flat alongside every other file's chunks in
+    the containing folder. Confirmed in production: a folder that
+    accumulates hundreds of chunked files' pieces (~70 items each)
+    reaches a scale where Internxt's own web UI becomes unreliable —
+    intermittent "item not found" false negatives even on a fresh
+    browser session, not caused by this script at all. Keeping each
+    file's ~70 pieces isolated in their own folder keeps every
+    individual folder's item count low regardless of how many large
+    files eventually get chunked into the same parent directory."""
+    return f"{CHUNK_SUBDIR_MARKER}{original_name}.{transfer_id}"
+
+
+def _find_chunk_subdir(names, original_name):
+    prefix = f"{CHUNK_SUBDIR_MARKER}{original_name}."
+    for n in names:
+        if n.startswith(prefix):
             return n
     return None
 
@@ -706,18 +738,34 @@ class ChunkHashMismatch(Exception):
         super().__init__(f"分片驗證失敗: {target_name} 第 {bad_list}/{total} 片雜湊不符")
 
 
-def _upload_chunked(page, abs_path: Path, ticker: StatusTicker, key: str, manifest: Manifest):
+def _upload_chunked(page, abs_path: Path, ticker: StatusTicker, key: str, manifest: Manifest, remote_dir: str):
     """Upload a large file as distinctively-named chunks + a manifest
     instead of one single upload (see module docstring point 5).
     Each chunk's own upload goes through the normal _upload_one /
     _wait_upload_settle path, so it's independently resumable: a
     chunk already marked "done" in the local manifest on a rerun is
     skipped, and the transfer id is derived deterministically from the
-    source file so a rerun finds the exact same chunk names."""
+    source file so a rerun finds the exact same chunk names.
+
+    Chunks + manifest go into their own dedicated subfolder (see
+    _chunk_subdir_name) rather than flat alongside every other file's
+    pieces in remote_dir — unless this file already has at least one
+    chunk uploaded flat from before this subfolder scheme existed, in
+    which case it keeps using the flat layout for consistency (splitting
+    one file's chunks across two remote locations would make
+    reassembly unreliable)."""
     size = abs_path.stat().st_size
     transfer_id = _chunk_transfer_id(abs_path, size, abs_path.stat().st_mtime_ns)
     n = -(-size // CHUNK_SIZE_BYTES)  # ceil division
     original_name = abs_path.name
+
+    any_chunk_done_flat = any(
+        manifest.status(f"{key}::chunk{i}of{n}::{transfer_id}") == "done"
+        for i in range(1, n + 1)
+    )
+    if not any_chunk_done_flat:
+        chunk_subdir = f"{remote_dir.strip('/')}/{_chunk_subdir_name(original_name, transfer_id)}".strip("/")
+        ensure_folder_path(page, chunk_subdir)
 
     tmp_dir = SCRIPT_DIR / f"_chunk_tmp_{transfer_id}"
     tmp_dir.mkdir(exist_ok=True)
@@ -906,7 +954,7 @@ def do_upload(args):
                         ensure_folder_path(page, remote_dir)
                         folder_cache.add(remote_dir)
                         if abs_path.stat().st_size >= CHUNK_THRESHOLD_BYTES:
-                            ok = _upload_chunked(page, abs_path, ticker, key, manifest)
+                            ok = _upload_chunked(page, abs_path, ticker, key, manifest, remote_dir)
                         else:
                             ok = _upload_one(page, abs_path, ticker, key)
                         if not ok:
@@ -1023,12 +1071,19 @@ def _reassemble_chunks_in_dir(local_dir: Path, ticker: StatusTicker):
         except (json.JSONDecodeError, OSError):
             continue
         folder = manifest_path.parent
+        # A manifest inside a dedicated ".ixtchunks-" subfolder (see
+        # _chunk_subdir_name) reconstructs one level UP, into that
+        # subfolder's parent — otherwise the downloaded tree would gain
+        # an extra directory layer that doesn't exist in the original
+        # source layout.
+        is_dedicated_subdir = folder.name.startswith(CHUNK_SUBDIR_MARKER)
+        dest_dir = folder.parent if is_dedicated_subdir else folder
         original_name = obj["original_name"]
         chunk_paths = [folder / c for c in obj["chunks"]]
         if not all(p.exists() for p in chunk_paths):
             print(f"   警告: {original_name} 的分片不齊全，保留原始分片檔案")
             continue
-        dest = folder / original_name
+        dest = dest_dir / original_name
         with open(dest, "wb") as out:
             for p in chunk_paths:
                 out.write(p.read_bytes())
@@ -1039,6 +1094,11 @@ def _reassemble_chunks_in_dir(local_dir: Path, ticker: StatusTicker):
         for p in chunk_paths:
             p.unlink(missing_ok=True)
         manifest_path.unlink(missing_ok=True)
+        if is_dedicated_subdir:
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
         print(f"   已還原分片檔案: {original_name}")
 
 
@@ -1124,6 +1184,17 @@ def _download_and_extract_file(page, remote_dir, target_name, dest_path: Path, t
         return None
 
     manifest_entry = _find_manifest_entry(names, target_name)
+    if not manifest_entry:
+        chunk_subdir = _find_chunk_subdir(names, target_name)
+        if chunk_subdir:
+            subdir_path = f"{remote_dir.strip('/')}/{chunk_subdir}".strip("/")
+            if not navigate_existing_only(page, subdir_path, hard_reload=True):
+                raise RuntimeError(f"找不到分片子資料夾 {subdir_path}")
+            names = list_current_folder(page)
+            manifest_entry = _find_manifest_entry(names, target_name)
+            if not manifest_entry:
+                raise RuntimeError(f"分片子資料夾 {subdir_path} 內找不到分片清單")
+
     if manifest_entry:
         tid = manifest_entry.split(MANIFEST_MARKER)[-1].split(".json")[0]
         tmp_dir = SCRIPT_DIR / f"_dl_chunk_tmp_{tid}"
