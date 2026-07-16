@@ -68,6 +68,10 @@ python internxt_transfer.py status
 # Read-only audit: confirm every "done" upload actually landed where expected
 python internxt_transfer.py audit
 
+# Merge separate --manifest files back into one (after running several
+# concurrent transfers, each with its own manifest)
+python internxt_transfer.py merge-manifest manifestA.json manifestB.json -o merged.json
+
 # Print visible UI buttons/current folder contents — for selector debugging
 python internxt_transfer.py debug-dump --remote <remote/folder/path>
 ```

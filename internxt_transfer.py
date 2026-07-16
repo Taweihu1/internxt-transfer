@@ -95,6 +95,7 @@ Usage:
     python internxt_transfer.py download <remote/path> <local/dest/dir>   [--interval 30] [--retries 3]
     python internxt_transfer.py status
     python internxt_transfer.py audit
+    python internxt_transfer.py merge-manifest manifestA.json manifestB.json -o merged.json
     python internxt_transfer.py debug-dump --remote <remote/folder/path>
 """
 import argparse
@@ -1230,6 +1231,48 @@ def cmd_audit(args):
 
 
 # ---------------------------------------------------------------------------
+# Merge manifests
+#
+# Running multiple concurrent transfers requires separate --manifest files
+# (see _manifest_from_args) since two processes sharing one clobber each
+# other's progress. This merges them back into one afterward. Safe by
+# construction for the common case (disjoint keys, since they were
+# separate jobs) — the conflict rule only matters if the same key somehow
+# appears in more than one input.
+# ---------------------------------------------------------------------------
+def cmd_merge_manifest(args):
+    merged = {}
+    total_inputs = 0
+    for path_str in args.inputs:
+        path = Path(path_str)
+        if not path.exists():
+            sys.exit(f"找不到檔案: {path}")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        total_inputs += len(data)
+        for key, entry in data.items():
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = entry
+                continue
+            # Conflict (same key in >1 input): prefer "done" over any
+            # other status; if both/neither are "done", prefer whichever
+            # has the later timestamp.
+            existing_done = existing.get("status") == "done"
+            entry_done = entry.get("status") == "done"
+            if entry_done and not existing_done:
+                merged[key] = entry
+            elif existing_done and not entry_done:
+                pass
+            elif entry.get("ts", "") > existing.get("ts", ""):
+                merged[key] = entry
+
+    out_path = Path(args.output)
+    out_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"合併 {len(args.inputs)} 個檔案，共 {total_inputs} 筆紀錄 -> {len(merged)} 筆（去除重複後）")
+    print(f"已寫入 -> {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Debug
 # ---------------------------------------------------------------------------
 def cmd_debug_dump(args):
@@ -1295,6 +1338,11 @@ def main():
     p_ad = sub.add_parser("audit", help="核對 transfer_manifest.json 裡標記完成的上傳，是否真的落在正確的遠端資料夾（唯讀）")
     p_ad.add_argument("--manifest", default=None, help="自訂 transfer_manifest.json 路徑")
 
+    p_mg = sub.add_parser("merge-manifest",
+                           help="合併多個 --manifest 檔案成一個（同時背景執行多個傳輸後，接續前用得到）")
+    p_mg.add_argument("inputs", nargs="+", help="要合併的 manifest 檔案路徑（兩個以上）")
+    p_mg.add_argument("-o", "--output", required=True, help="合併後輸出的檔案路徑")
+
     p_dbg = sub.add_parser("debug-dump", help="登入後印出畫面上的按鈕/項目，方便校正選取器")
     p_dbg.add_argument("--remote", default="", help="要先導航進去的遠端目錄（可留空）")
 
@@ -1306,10 +1354,12 @@ def main():
     # `"` by the OS's C-runtime argv parser. `"` can never legitimately
     # appear in a Windows path or in a remote Internxt path, so stripping
     # a trailing one here undoes exactly that mis-parse.
-    for attr in ("local", "remote", "manifest"):
+    for attr in ("local", "remote", "manifest", "output"):
         val = getattr(args, attr, None)
         if val:
             setattr(args, attr, val.rstrip('"'))
+    if getattr(args, "inputs", None):
+        args.inputs = [v.rstrip('"') for v in args.inputs]
 
     if args.cmd == "status":
         _manifest_from_args(args).print_status()
@@ -1324,6 +1374,8 @@ def main():
         do_download(args)
     elif args.cmd == "audit":
         cmd_audit(args)
+    elif args.cmd == "merge-manifest":
+        cmd_merge_manifest(args)
     elif args.cmd == "debug-dump":
         cmd_debug_dump(args)
 
