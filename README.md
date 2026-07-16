@@ -29,6 +29,14 @@ the crypto itself.
 - **`audit`**: read-only cross-check of every upload the manifest marks
   "done" against what's actually visible on Internxt Drive, to catch a
   file that reported success locally but landed in the wrong folder.
+- **Skip-if-identical** (on by default, `--no-skip-existing` to disable):
+  before uploading, checks whether the remote folder already has a
+  same-named file and, if so, downloads and hashes it — skips re-sending
+  if it matches the local source, uploads a new version if it doesn't.
+- **`--manifest <path>`**: point at a custom transfer_manifest.json.
+  Required when running multiple transfers concurrently (e.g. several
+  backgrounded jobs) — each must use its own file, since two processes
+  sharing one would silently clobber each other's progress.
 - **Live status**: a background ticker prints overall progress and
   in-flight items every N seconds (default 30) during upload/download.
 

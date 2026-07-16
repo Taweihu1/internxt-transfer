@@ -758,6 +758,40 @@ def _manifest_from_args(args):
     return Manifest(path=Path(path)) if path else Manifest()
 
 
+def _skip_if_remote_matches(page, remote_dir, abs_path, ticker, key, manifest):
+    """--skip-existing: if remote_dir already has an item named
+    abs_path.name (plain or chunked), download it and compare sha256
+    against the local source. Returns True (and marks key "done") only
+    on a confirmed match — anything else (not present, mismatch, or any
+    error along the way) returns False so the normal upload path runs,
+    which will create a new version rather than silently skip on doubt.
+    """
+    target_name = abs_path.name
+    try:
+        ensure_folder_path(page, remote_dir)
+        names = list_current_folder(page)
+        if target_name not in names and not _find_manifest_entry(names, target_name):
+            return False
+        tmp_check = SCRIPT_DIR / f"_skipcheck_tmp_{target_name}"
+        try:
+            chunk_verified_hash = _download_and_extract_file(page, remote_dir, target_name, tmp_check, ticker)
+            remote_hash = chunk_verified_hash or _sha256_file_with_progress(
+                tmp_check, ticker, key, label="計算遠端下載後雜湊中")
+        finally:
+            tmp_check.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"   確認遠端是否相同時發生錯誤（{e}），改為直接嘗試上傳: {target_name}")
+        return False
+
+    local_hash = _sha256_file_with_progress(abs_path, ticker, key, label="計算本機雜湊中")
+    if remote_hash != local_hash:
+        print(f"   遠端已有同名檔案但內容不同，將上傳新版本: {target_name}")
+        return False
+
+    manifest.mark(key, "done", size=abs_path.stat().st_size, sha256=local_hash)
+    return True
+
+
 def do_upload(args):
     local_path = Path(args.local).resolve()
     if not local_path.exists():
@@ -788,6 +822,10 @@ def do_upload(args):
                 # back into a "/"-separated remote_dir.
                 rel_parent = "/".join(rel.split("/")[:-1])
                 remote_dir = f"{args.remote.strip('/')}/{rel_parent}".strip("/") if rel_parent else args.remote
+
+                if args.skip_existing and _skip_if_remote_matches(page, remote_dir, abs_path, ticker, key, manifest):
+                    print(f"   遠端已存在且內容相同，略過: {rel}")
+                    continue
 
                 attempts = 0
                 ok = False
@@ -1238,6 +1276,9 @@ def main():
     p_up.add_argument("--manifest", default=None,
                        help="自訂 transfer_manifest.json 路徑；同時背景執行多個傳輸時，每個都要指定不同的檔案，"
                             "否則會互相覆蓋彼此的進度紀錄")
+    p_up.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=True,
+                       help="上傳前先確認遠端是否已有同名檔案且內容相同（下載回來比對 sha256），"
+                            "相同就略過不重傳；不同才會上傳新版本（預設開啟，用 --no-skip-existing 關閉）")
 
     p_dl = sub.add_parser("download", help="從 Internxt Drive 下載檔案/目錄到本機")
     p_dl.add_argument("remote", help="遠端來源路徑（檔案或目錄）")
